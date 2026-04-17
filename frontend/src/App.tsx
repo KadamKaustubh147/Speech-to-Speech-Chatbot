@@ -1,7 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useVoiceRecorder } from './hooks/useVoiceRecorder';
-import { useTTS } from './hooks/useTTS';
-import { transcribeAndChat, clearSession } from './hooks/api';
+import { useVoiceChat } from './hooks/useVoiceChat';
 import { Message, RecordingStatus } from './types';
 import './App.css';
 
@@ -49,94 +47,36 @@ function MessageBubble({ msg }: { msg: Message }) {
 }
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [status, setStatus] = useState<RecordingStatus>('idle');
-  const [error, setError] = useState<string | null>(null);
+  const [sessionId] = useState<string>(generateId());
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const { isRecording, startRecording, stopRecording, error: recError } = useVoiceRecorder();
-  const { speak, cancel: cancelTTS, isSpeaking } = useTTS();
-
-  // Sync recorder error
-  useEffect(() => {
-    if (recError) setError(recError);
-  }, [recError]);
+  const {
+    startRecording,
+    stopRecording,
+    clearSession,
+    status,
+    error,
+    messages
+  } = useVoiceChat();
 
   // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Sync speaking status
-  useEffect(() => {
-    if (isSpeaking) setStatus('speaking');
-  }, [isSpeaking]);
-
   const handleMicPress = useCallback(async () => {
     if (status === 'processing' || status === 'speaking') return;
 
-    if (!isRecording) {
-      setError(null);
-      setStatus('recording');
-      await startRecording();
-    } else {
-      setStatus('processing');
-      const blob = await stopRecording();
-
-      if (!blob || blob.size < 1000) {
-        setError('Recording too short. Please hold and speak clearly.');
-        setStatus('idle');
-        return;
-      }
-
-      try {
-        const data = await transcribeAndChat(blob, sessionId);
-
-        if (!sessionId) setSessionId(data.session_id);
-
-        // Add user message
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: generateId(),
-            role: 'user',
-            content: data.transcript,
-            transcript: data.transcript,
-            timestamp: new Date(),
-          },
-        ]);
-
-        // Add assistant message
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: generateId(),
-            role: 'assistant',
-            content: data.response,
-            timestamp: new Date(),
-          },
-        ]);
-
-        // Speak
-        speak(data.response, () => setStatus('idle'));
-        setStatus('speaking');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Something went wrong.';
-        setError(msg);
-        setStatus('idle');
-      }
+    if (status === 'idle') {
+      await startRecording(sessionId);
+    } else if (status === 'recording') {
+      stopRecording();
     }
-  }, [status, isRecording, sessionId, startRecording, stopRecording, speak]);
+  }, [status, sessionId, startRecording, stopRecording]);
 
-  const handleClear = useCallback(async () => {
-    cancelTTS();
-    if (sessionId) await clearSession(sessionId).catch(() => {});
-    setSessionId(null);
-    setMessages([]);
-    setStatus('idle');
-    setError(null);
-  }, [sessionId, cancelTTS]);
+  const handleClear = useCallback(() => {
+    clearSession();
+  }, [clearSession]);
 
   const micLabel =
     status === 'recording'
@@ -149,7 +89,6 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* Decorative grid */}
       <div className="grid-bg" aria-hidden="true" />
 
       <header className="app__header">
@@ -189,12 +128,11 @@ export default function App() {
       {error && (
         <div className="error-banner" role="alert">
           <span>⚠ {error}</span>
-          <button onClick={() => setError(null)} aria-label="Dismiss">✕</button>
         </div>
       )}
 
       <footer className="app__footer">
-        <WaveformBars active={isRecording} />
+        <WaveformBars active={status === 'recording'} />
         <button
           className={`mic-btn mic-btn--${status}`}
           onClick={handleMicPress}
@@ -203,16 +141,16 @@ export default function App() {
         >
           <span className="mic-btn__ring mic-btn__ring--1" />
           <span className="mic-btn__ring mic-btn__ring--2" />
-          <MicIcon recording={isRecording} status={status} />
+          <MicIcon status={status} />
           <span className="mic-btn__label">{micLabel}</span>
         </button>
-        <WaveformBars active={isSpeaking} />
+        <WaveformBars active={status === 'speaking'} />
       </footer>
     </div>
   );
 }
 
-function MicIcon({ recording, status }: { recording: boolean; status: RecordingStatus }) {
+function MicIcon({ status }: { status: RecordingStatus }) {
   if (status === 'processing') {
     return (
       <svg className="mic-icon spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -231,7 +169,7 @@ function MicIcon({ recording, status }: { recording: boolean; status: RecordingS
   }
   return (
     <svg className="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <rect x="9" y="2" width="6" height="12" rx="3" fill={recording ? 'currentColor' : 'none'} />
+      <rect x="9" y="2" width="6" height="12" rx="3" fill={status === 'recording' ? 'currentColor' : 'none'} />
       <path d="M5 10a7 7 0 0 0 14 0" />
       <line x1="12" y1="17" x2="12" y2="22" />
       <line x1="8" y1="22" x2="16" y2="22" />
