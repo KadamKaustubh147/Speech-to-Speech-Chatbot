@@ -20,7 +20,6 @@ export function useVoiceChat() {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Use the Vite proxy in dev, or Nginx path in production
     const wsUrl = import.meta.env.DEV 
         ? `ws://${window.location.host}/ws/${sessionId}`
         : `${protocol}//${window.location.host}/ws/${sessionId}`;
@@ -59,19 +58,15 @@ export function useVoiceChat() {
   }, []);
 
   const playAudioData = async (arrayBuffer: ArrayBuffer) => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-    }
+    if (!audioContextRef.current) return;
     const ctx = audioContextRef.current;
     
     try {
-      // Bedrock returns raw 16-bit 16kHz PCM. browsers expect WAV headers.
-      // We manually construct an AudioBuffer from the raw PCM data.
       const int16Array = new Int16Array(arrayBuffer);
       const audioBuffer = ctx.createBuffer(1, int16Array.length, 16000);
       const channelData = audioBuffer.getChannelData(0);
       for (let i = 0; i < int16Array.length; i++) {
-        channelData[i] = int16Array[i] / 32768.0; // Convert 16-bit int to float32
+        channelData[i] = int16Array[i] / 32768.0;
       }
 
       const source = ctx.createBufferSource();
@@ -88,15 +83,29 @@ export function useVoiceChat() {
 
   const startRecording = useCallback(async (sessionId: string) => {
     setError(null);
+
+    // FIX 1: Guard against insecure HTTP contexts
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setError('Microphone blocked. You must use localhost or HTTPS.');
+      return;
+    }
+
     try {
       connect(sessionId);
       
+      // FIX 2: Create AudioContext BEFORE await to satisfy Safari/iOS rules
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContextClass({ sampleRate: 16000 });
+      }
+      const ctx = audioContextRef.current;
+
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
-
-      // Bedrock expects 16kHz audio sample rate
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      audioContextRef.current = ctx;
 
       const source = ctx.createMediaStreamSource(stream);
       const processor = ctx.createScriptProcessor(4096, 1, 1);
@@ -109,7 +118,6 @@ export function useVoiceChat() {
           for (let i = 0; i < inputData.length; i++) {
             pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
           }
-          // Send raw PCM binary to backend
           wsRef.current.send(pcmData.buffer);
         }
       };
@@ -119,7 +127,7 @@ export function useVoiceChat() {
       setStatus('recording');
 
     } catch (err) {
-      setError('Microphone access denied or error starting recording.');
+      setError('Microphone permission denied.');
       setStatus('idle');
     }
   }, [connect]);
@@ -134,7 +142,6 @@ export function useVoiceChat() {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-    // Signal to the backend that the user finished speaking
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'end_of_turn' }));
     }

@@ -1,11 +1,9 @@
 import asyncio
-import base64
 import json
 import os
-import uuid
+import traceback
 from typing import Dict
 
-import boto3
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_aws.chat_models.bedrock_nova_sonic import ChatBedrockNovaSonic
@@ -19,27 +17,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Model config
-MODEL_ID = "amazon.nova-2-sonic-v1:0"   # or "amazon.nova-sonic-v1:0"
-REGION   = os.getenv("AWS_REGION", "us-east-1")
-VOICE_ID = os.getenv("NOVA_VOICE_ID", "matthew")  # matthew | tiffany | amy
-
 # Active sessions: session_id → NovaSonicSession
 sessions: Dict[str, object] = {}
 
-
-BEDROCK_API_KEY = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
-
 def make_model():
+    """
+    Initializes the Bedrock Nova Sonic model.
+    Boto3 will automatically authenticate using the AWS_ACCESS_KEY_ID 
+    and AWS_SECRET_ACCESS_KEY environment variables provided by Docker.
+    """
     return ChatBedrockNovaSonic(
         model_id=os.getenv("NOVA_MODEL_ID", "amazon.nova-sonic-v1:0"),
         region_name=os.getenv("AWS_REGION", "us-east-1"),
         voice_id=os.getenv("NOVA_VOICE_ID", "matthew"),
-        credentials_profile_name=None,
-        # Bearer token auth
-        aws_bearer_token_bedrock=BEDROCK_API_KEY,
     )
-
 
 @app.get("/health")
 def health():
@@ -49,9 +40,12 @@ def health():
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str):
     await ws.accept()
-    model = make_model()
 
     try:
+        # Initializing the model INSIDE the try block so validation 
+        # or auth errors are caught and printed to the terminal.
+        model = make_model()
+
         async with model.create_session() as session:
             sessions[session_id] = session
 
@@ -67,13 +61,16 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 task.cancel()
 
     except WebSocketDisconnect:
-        pass
+        print(f"[{session_id}] Client disconnected normally.")
+    except Exception as e:
+        print(f"[{session_id}] SESSION SETUP ERROR: {e}")
+        traceback.print_exc()
     finally:
         sessions.pop(session_id, None)
 
-
 async def _send_loop(ws: WebSocket, session):
     """Receive audio chunks from browser → forward to Nova Sonic."""
+    audio_sent = False
     try:
         while True:
             msg = await ws.receive()
@@ -83,15 +80,21 @@ async def _send_loop(ws: WebSocket, session):
             if "bytes" in msg and msg["bytes"]:
                 # Raw PCM audio bytes from browser
                 await session.send_audio_chunk(msg["bytes"])
+                audio_sent = True
 
             elif "text" in msg and msg["text"]:
                 data = json.loads(msg["text"])
                 if data.get("type") == "end_of_turn":
-                    # Signal that the user finished speaking
-                    await session.send_audio_chunk(b"", end_of_turn=True)
-    except Exception:
-        pass
-
+                    # Only tell AWS the turn ended IF audio was actually captured
+                    if audio_sent:
+                        await session.end_audio_input()
+                        audio_sent = False # reset for the next turn
+                    else:
+                        print(f"Skipped ending turn: No audio was sent by the client.")
+    except Exception as e:
+        print(f"SEND LOOP ERROR: {e}")
+        import traceback
+        traceback.print_exc()
 
 async def _receive_loop(ws: WebSocket, session):
     """Receive events from Nova Sonic → forward audio/text to browser."""
@@ -108,5 +111,6 @@ async def _receive_loop(ws: WebSocket, session):
                 }))
             elif event["type"] == "content_block_stop":
                 await ws.send_text(json.dumps({"type": "turn_end"}))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"RECEIVE LOOP ERROR: {e}")
+        traceback.print_exc()
