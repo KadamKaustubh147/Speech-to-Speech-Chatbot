@@ -8,8 +8,11 @@ services:
     container_name: voiceai_backend
     restart: unless-stopped
     environment:
-      ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # If you are using bearer token auth as seen in main.py, keep this:
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK}
     ports:
       - "8000:8000"
     networks:
