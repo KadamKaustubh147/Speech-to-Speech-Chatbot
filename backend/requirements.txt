@@ -1,19 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
-langchain-aws[nova-sonic]
-boto3
-# assemblyai
-
-# ── LangChain v1 ──────────────────────────────────────────────────────────────
-# New unified package — includes create_agent, init_chat_model, InMemorySaver
-langchain
-langgraph
-langgraph-checkpoint
-
-# Google Gemini via LangChain integration
-# langchain-google-genai
-# google-generativeai
-
 pydantic
 httpx
+aws-sdk-bedrock-runtime
+smithy-aws-core

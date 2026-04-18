@@ -1,12 +1,18 @@
-import asyncio
-import json
 import os
+import asyncio
+import base64
+import json
+import uuid
 import traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_aws.chat_models.bedrock_nova_sonic import ChatBedrockNovaSonic
 
-app = FastAPI(title="Nova Sonic Voice Chatbot")
+from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
+from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
+from aws_sdk_bedrock_runtime.config import Config
+from smithy_aws_core.identity.environment import EnvironmentCredentialsResolver
+
+app = FastAPI(title="Nova Sonic Voice Chatbot (Bidirectional Stream)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,150 +21,255 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def make_model():
-    return ChatBedrockNovaSonic(
-        model_id=os.getenv("NOVA_MODEL_ID", "amazon.nova-sonic-v1:0"),
-        region_name=os.getenv("AWS_REGION", "us-east-1"),
-        voice_id=os.getenv("NOVA_VOICE_ID", "matthew"),
-    )
-
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+class WSNovaSonic:
+    def __init__(self, ws: WebSocket, session_id: str):
+        self.ws = ws
+        self.session_id = session_id
+        self.model_id = os.getenv("NOVA_MODEL_ID", "amazon.nova-sonic-v1:0").strip()
+        self.region = os.getenv("AWS_REGION", "us-east-1").strip()
+        self.client = None
+        self.stream = None
+        self.is_active = False
+        
+        self.prompt_name = str(uuid.uuid4())
+        self.content_name = str(uuid.uuid4())
+        self.audio_content_name = None  # Generated dynamically per turn
+        
+        self.in_audio_turn = False
+
+    def _initialize_client(self):
+        """Initialize the Bedrock client using the Smithy core."""
+        config = Config(
+            endpoint_uri=f"https://bedrock-runtime.{self.region}.amazonaws.com",
+            region=self.region,
+            aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
+        )
+        self.client = BedrockRuntimeClient(config=config)
+
+    async def send_event(self, event_json):
+        """Send a raw JSON event to the Bedrock stream."""
+        event = InvokeModelWithBidirectionalStreamInputChunk(
+            value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
+        )
+        await self.stream.input_stream.send(event)
+
+    async def start_session(self):
+        """Initialize connection and send system prompts."""
+        if not self.client:
+            self._initialize_client()
+            
+        self.stream = await self.client.invoke_model_with_bidirectional_stream(
+            InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
+        )
+        self.is_active = True
+        
+        # 1. Session Start
+        await self.send_event('''
+        {
+          "event": {
+            "sessionStart": {
+              "inferenceConfiguration": { "maxTokens": 1024, "topP": 0.9, "temperature": 0.7 }
+            }
+          }
+        }
+        ''')
+        
+        # 2. Prompt Start (Note: Output changed to 16000Hz to match your frontend)
+        await self.send_event(f'''
+        {{
+          "event": {{
+            "promptStart": {{
+              "promptName": "{self.prompt_name}",
+              "textOutputConfiguration": {{ "mediaType": "text/plain" }},
+              "audioOutputConfiguration": {{
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 16000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "voiceId": "matthew",
+                "encoding": "base64",
+                "audioType": "SPEECH"
+              }}
+            }}
+          }}
+        }}
+        ''')
+        
+        # 3. System Prompt setup
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "contentStart": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}",
+                    "type": "TEXT",
+                    "interactive": false,
+                    "role": "SYSTEM",
+                    "textInputConfiguration": {{ "mediaType": "text/plain" }}
+                }}
+            }}
+        }}
+        ''')
+        
+        system_prompt = "You are a friendly, concise voice assistant. Keep responses brief."
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "textInput": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}",
+                    "content": "{system_prompt}"
+                }}
+            }}
+        }}
+        ''')
+        
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "contentEnd": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}"
+                }}
+            }}
+        }}
+        ''')
+
+    async def start_audio_input(self):
+        """Called when the user clicks the mic."""
+        self.audio_content_name = str(uuid.uuid4())
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "contentStart": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}",
+                    "type": "AUDIO",
+                    "interactive": true,
+                    "role": "USER",
+                    "audioInputConfiguration": {{
+                        "mediaType": "audio/lpcm",
+                        "sampleRateHertz": 16000,
+                        "sampleSizeBits": 16,
+                        "channelCount": 1,
+                        "audioType": "SPEECH",
+                        "encoding": "base64"
+                    }}
+                }}
+            }}
+        }}
+        ''')
+
+    async def send_audio_chunk(self, audio_bytes):
+        """Pass mic data from the frontend to Bedrock."""
+        if not self.is_active: return
+        blob = base64.b64encode(audio_bytes).decode('utf-8')
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "audioInput": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}",
+                    "content": "{blob}"
+                }}
+            }}
+        }}
+        ''')
+
+    async def end_audio_input(self):
+        """Called when the user releases the mic."""
+        await self.send_event(f'''
+        {{
+            "event": {{
+                "contentEnd": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}"
+                }}
+            }}
+        }}
+        ''')
+
+    async def process_bedrock_responses(self):
+        """Listen to Bedrock and route data back to the frontend."""
+        try:
+            while self.is_active:
+                output = await self.stream.await_output()
+                result = await output[1].receive()
+                
+                if result.value and result.value.bytes_:
+                    response_data = result.value.bytes_.decode('utf-8')
+                    json_data = json.loads(response_data)
+                    
+                    if 'event' in json_data:
+                        event = json_data['event']
+                        
+                        # 1. Route text to UI bubbles
+                        if 'textOutput' in event:
+                            text = event['textOutput']['content']
+                            await self.ws.send_text(json.dumps({
+                                "type": "transcript",
+                                "role": "assistant",
+                                "text": text
+                            }))
+                            
+                        # 2. Route raw audio to the frontend speakers
+                        elif 'audioOutput' in event:
+                            audio_bytes = base64.b64decode(event['audioOutput']['content'])
+                            await self.ws.send_bytes(audio_bytes)
+                            
+                        # 3. Handle End of Turn
+                        elif 'contentEnd' in event:
+                            # When Bedrock finishes replying, tell the UI to stop spinning
+                            await self.ws.send_text(json.dumps({"type": "turn_end"}))
+                            
+        except Exception as e:
+            print(f"[{self.session_id}] Bedrock processing stopped: {e}")
 
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str):
     await ws.accept()
     print(f"[{session_id}] Connected")
-
+    
+    bot = WSNovaSonic(ws, session_id)
+    
     try:
-        model = make_model()
+        await bot.start_session()
+        
+        # Start listening to Bedrock in the background
+        response_task = asyncio.create_task(bot.process_bedrock_responses())
 
-        async with model.create_session() as session:
-
-            ready_event = asyncio.Event()
-
-            state = {
-                "turn_active": False,
-                "audio_sent": False,
-                "initialized": False,  # 🔥 NEW
-            }
-
-            send_task = asyncio.create_task(
-                _send_loop(ws, session, session_id, ready_event, state)
-            )
-            receive_task = asyncio.create_task(
-                _receive_loop(ws, session, session_id, ready_event, state)
-            )
-
-            await asyncio.wait([send_task, receive_task], return_when=asyncio.FIRST_COMPLETED)
-
-    except Exception as e:
-        print(f"[{session_id}] ERROR: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# SEND LOOP
-# ─────────────────────────────────────────────────────────────
-async def _send_loop(ws, session, session_id, ready_event, state):
-    try:
-        await asyncio.wait_for(ready_event.wait(), timeout=10.0)
-        print(f"[{session_id}] Ready for audio")
-
+        # Listen to the Frontend
         while True:
             msg = await ws.receive()
-
             if msg["type"] == "websocket.disconnect":
                 break
-
-            # ── AUDIO ─────────────────────────────────────
+                
+            # Audio chunks arriving from frontend mic
             if msg.get("bytes"):
-                if not state["turn_active"]:
-                    state["turn_active"] = True
-                    print(f"[{session_id}] TURN START")
-
-                await session.send_audio_chunk(msg["bytes"])
-                state["audio_sent"] = True
-
-            # ── CONTROL ───────────────────────────────────
+                if not bot.in_audio_turn:
+                    await bot.start_audio_input()
+                    bot.in_audio_turn = True
+                await bot.send_audio_chunk(msg["bytes"])
+                
+            # Control messages from frontend
             elif msg.get("text"):
                 try:
                     data = json.loads(msg["text"])
-                except:
-                    continue
-
-                if data.get("type") == "end_of_turn":
-
-                    if state["turn_active"] and state["audio_sent"]:
-                        print(f"[{session_id}] TURN END → sending to Nova")
-
-                        await session.end_audio_input()
-
-                        state["turn_active"] = False
-                        state["audio_sent"] = False
-
-                    else:
-                        print(
-                            f"[{session_id}] Ignored end_of_turn "
-                            f"(turn_active={state['turn_active']}, audio_sent={state['audio_sent']})"
-                        )
+                    if data.get("type") == "end_of_turn" and bot.in_audio_turn:
+                        await bot.end_audio_input()
+                        bot.in_audio_turn = False
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
-        pass
+        print(f"[{session_id}] Disconnected")
     except Exception as e:
-        print(f"[{session_id}] SEND ERROR: {e}")
+        print(f"[{session_id}] WS ERROR: {e}")
         traceback.print_exc()
-
-
-# ─────────────────────────────────────────────────────────────
-# RECEIVE LOOP
-# ─────────────────────────────────────────────────────────────
-async def _receive_loop(ws, session, session_id, ready_event, state):
-    try:
-        first = True
-
-        async for event in session.receive_events():
-
-            # 🔥 THIS IS THE REAL FIX
-            if first:
-                ready_event.set()
-                first = False
-
-                # 🚨 FORCE CONTENT BLOCK CREATION
-                if not state["initialized"]:
-                    print(f"[{session_id}] Initializing content block")
-
-                    # Send tiny silent audio to open block
-                    await session.send_audio_chunk(b"\x00\x00")
-                    state["initialized"] = True
-
-            event_type = event.get("type")
-
-            if event_type == "audio":
-                await ws.send_bytes(event["audio"])
-
-            elif event_type == "text":
-                await ws.send_text(json.dumps({
-                    "type": "transcript",
-                    "role": event.get("role", "assistant"),
-                    "text": event.get("text", ""),
-                }))
-
-            elif event_type == "content_block_stop":
-                print(f"[{session_id}] TURN COMPLETE")
-                state["turn_active"] = False
-
-                await ws.send_text(json.dumps({
-                    "type": "turn_end"
-                }))
-
-            elif event_type == "error":
-                msg = event.get("message", "Unknown error")
-                print(f"[{session_id}] Nova error: {msg}")
-
-    except Exception as e:
-        print(f"[{session_id}] RECEIVE ERROR: {e}")
-        traceback.print_exc()
+    finally:
+        bot.is_active = False
