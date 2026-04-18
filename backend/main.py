@@ -12,7 +12,7 @@ from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInp
 from aws_sdk_bedrock_runtime.config import Config
 from smithy_aws_core.identity.environment import EnvironmentCredentialsResolver
 
-app = FastAPI(title="Nova Sonic Voice Chatbot (Bidirectional Stream)")
+app = FastAPI(title="Nova Sonic Voice Chatbot (With Real Memory)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,61 +25,50 @@ app.add_middleware(
 def health():
     return {"status": "ok"}
 
+# ── THE MEMORY ARRAY ──────────────────────────────────────────
+session_memory_store = {}
+
 class WSNovaSonic:
     def __init__(self, ws: WebSocket, session_id: str):
         self.ws = ws
         self.session_id = session_id
+        
+        if self.session_id not in session_memory_store:
+            session_memory_store[self.session_id] = []
+        self.memory = session_memory_store[self.session_id]
+        
         self.model_id = os.getenv("NOVA_MODEL_ID", "amazon.nova-sonic-v1:0").strip()
         self.region = os.getenv("AWS_REGION", "us-east-1").strip()
-        self.client = None
-        self.stream = None
-        self.is_active = False
         
-        self.prompt_name = str(uuid.uuid4())
-        self.content_name = str(uuid.uuid4())
-        self.audio_content_name = None  # Generated dynamically per turn
-        
-        self.in_audio_turn = False
-
-    def _initialize_client(self):
-        """Initialize the Bedrock client using the Smithy core."""
         config = Config(
             endpoint_uri=f"https://bedrock-runtime.{self.region}.amazonaws.com",
             region=self.region,
             aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
         )
         self.client = BedrockRuntimeClient(config=config)
+        
+        self.stream = None
+        self.prompt_name = None
+        self.audio_c_name = None
+        self.in_audio_turn = False
 
-    async def send_event(self, event_json):
-        """Send a raw JSON event to the Bedrock stream."""
-        event = InvokeModelWithBidirectionalStreamInputChunk(
-            value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
-        )
-        await self.stream.input_stream.send(event)
+    async def _send_event(self, event_json):
+        if self.stream:
+            event = InvokeModelWithBidirectionalStreamInputChunk(
+                value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
+            )
+            await self.stream.input_stream.send(event)
 
-    async def start_session(self):
-        """Initialize connection and send system prompts."""
-        if not self.client:
-            self._initialize_client()
-            
+    async def start_audio_turn(self):
+        """Creates a fresh stream per turn and injects the ENTIRE memory array as context."""
         self.stream = await self.client.invoke_model_with_bidirectional_stream(
             InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
         )
-        self.is_active = True
+        self.prompt_name = str(uuid.uuid4())
         
-        # 1. Session Start
-        await self.send_event('''
-        {
-          "event": {
-            "sessionStart": {
-              "inferenceConfiguration": { "maxTokens": 1024, "topP": 0.9, "temperature": 0.7 }
-            }
-          }
-        }
-        ''')
+        await self._send_event('{"event": {"sessionStart": {"inferenceConfiguration": {"maxTokens": 1024, "topP": 0.9, "temperature": 0.7}}}}')
         
-        # 2. Prompt Start (Note: Output changed to 16000Hz to match your frontend)
-        await self.send_event(f'''
+        await self._send_event(f'''
         {{
           "event": {{
             "promptStart": {{
@@ -99,55 +88,45 @@ class WSNovaSonic:
         }}
         ''')
         
-        # 3. System Prompt setup
-        await self.send_event(f'''
-        {{
-            "event": {{
-                "contentStart": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.content_name}",
-                    "type": "TEXT",
-                    "interactive": false,
-                    "role": "SYSTEM",
-                    "textInputConfiguration": {{ "mediaType": "text/plain" }}
-                }}
-            }}
-        }}
+        sys_c_name = str(uuid.uuid4())
+        await self._send_event(f'''
+        {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "type": "TEXT", "interactive": false, "role": "SYSTEM", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
         ''')
         
-        system_prompt = "You are a friendly, concise voice assistant. Keep responses brief."
-        await self.send_event(f'''
-        {{
-            "event": {{
-                "textInput": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.content_name}",
-                    "content": "{system_prompt}"
-                }}
-            }}
-        }}
+        system_prompt = json.dumps("You are a friendly voice assistant. Keep responses brief and conversational.")
+        await self._send_event(f'''
+        {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "content": {system_prompt} }} }} }}
         ''')
         
-        await self.send_event(f'''
-        {{
-            "event": {{
-                "contentEnd": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.content_name}"
-                }}
-            }}
-        }}
+        await self._send_event(f'''
+        {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}" }} }} }}
         ''')
 
-    async def start_audio_input(self):
-        """Called when the user clicks the mic."""
-        self.audio_content_name = str(uuid.uuid4())
-        await self.send_event(f'''
+        # Inject conversation history cleanly
+        for msg in self.memory:
+            hist_c_name = str(uuid.uuid4())
+            role = msg["role"].upper()
+            safe_text = json.dumps(msg["text"])
+            
+            await self._send_event(f'''
+            {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "type": "TEXT", "interactive": false, "role": "{role}", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
+            ''')
+            
+            await self._send_event(f'''
+            {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "content": {safe_text} }} }} }}
+            ''')
+            
+            await self._send_event(f'''
+            {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}" }} }} }}
+            ''')
+
+        self.audio_c_name = str(uuid.uuid4())
+        await self._send_event(f'''
         {{
             "event": {{
                 "contentStart": {{
                     "promptName": "{self.prompt_name}",
-                    "contentName": "{self.audio_content_name}",
+                    "contentName": "{self.audio_c_name}",
                     "type": "AUDIO",
                     "interactive": true,
                     "role": "USER",
@@ -164,70 +143,91 @@ class WSNovaSonic:
         }}
         ''')
 
+        self.in_audio_turn = True
+        asyncio.create_task(self.process_responses(self.stream))
+
     async def send_audio_chunk(self, audio_bytes):
-        """Pass mic data from the frontend to Bedrock."""
-        if not self.is_active: return
-        blob = base64.b64encode(audio_bytes).decode('utf-8')
-        await self.send_event(f'''
-        {{
-            "event": {{
-                "audioInput": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.audio_content_name}",
-                    "content": "{blob}"
-                }}
-            }}
-        }}
-        ''')
+        if self.in_audio_turn and self.stream:
+            blob = base64.b64encode(audio_bytes).decode('utf-8')
+            await self._send_event(f'''
+            {{ "event": {{ "audioInput": {{ "promptName": "{self.prompt_name}", "contentName": "{self.audio_c_name}", "content": "{blob}" }} }} }}
+            ''')
 
-    async def end_audio_input(self):
-        """Called when the user releases the mic."""
-        await self.send_event(f'''
-        {{
-            "event": {{
-                "contentEnd": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.audio_content_name}"
-                }}
-            }}
-        }}
-        ''')
-
-    async def process_bedrock_responses(self):
-        """Listen to Bedrock and route data back to the frontend."""
-        try:
-            while self.is_active:
-                output = await self.stream.await_output()
-                result = await output[1].receive()
+    async def end_audio_turn(self):
+        """Cleanly seal the AWS stream so it generates a response and unlocks the frontend."""
+        if self.in_audio_turn and self.stream:
+            try:
+                await self._send_event(f'''
+                {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{self.audio_c_name}" }} }} }}
+                ''')
+                await self._send_event(f'''
+                {{ "event": {{ "promptEnd": {{ "promptName": "{self.prompt_name}" }} }} }}
+                ''')
                 
-                if result.value and result.value.bytes_:
+                # Crucial: Close the stream to tell AWS we are done sending forever
+                await self._send_event('{ "event": { "sessionEnd": {} } }')
+                await self.stream.input_stream.close()
+            except Exception as e:
+                print(f"Error ending turn: {e}")
+                
+            self.in_audio_turn = False
+
+    async def process_responses(self, active_stream):
+        """Listen to AWS output until it naturally closes, ensuring all text and audio is received."""
+        user_text = ""
+        assistant_text = ""
+        current_role = "assistant"
+        
+        try:
+            while True:
+                output = await active_stream.await_output()
+                if not output: break
+                
+                result = await output[1].receive()
+                if not result or not hasattr(result, 'value') or not result.value: break
+                
+                if result.value.bytes_:
                     response_data = result.value.bytes_.decode('utf-8')
                     json_data = json.loads(response_data)
                     
                     if 'event' in json_data:
                         event = json_data['event']
                         
-                        # 1. Route text to UI bubbles
-                        if 'textOutput' in event:
+                        if 'contentStart' in event:
+                            current_role = event['contentStart'].get('role', 'ASSISTANT').lower()
+                            
+                        elif 'textOutput' in event:
                             text = event['textOutput']['content']
+                            if current_role == "user":
+                                user_text += text
+                            else:
+                                assistant_text += text
+                                
                             await self.ws.send_text(json.dumps({
                                 "type": "transcript",
-                                "role": "assistant",
+                                "role": current_role,
                                 "text": text
                             }))
                             
-                        # 2. Route raw audio to the frontend speakers
                         elif 'audioOutput' in event:
                             audio_bytes = base64.b64decode(event['audioOutput']['content'])
                             await self.ws.send_bytes(audio_bytes)
                             
-                        # 3. Handle End of Turn
-                        elif 'contentEnd' in event:
-                            # When Bedrock finishes replying, tell the UI to stop spinning
-                            await self.ws.send_text(json.dumps({"type": "turn_end"}))
-                            
         except Exception as e:
-            print(f"[{self.session_id}] Bedrock processing stopped: {e}")
+            # Stream gracefully closes when AWS finishes its response
+            pass
+        finally:
+            # Tell the frontend the turn is fully complete so the mic button resets
+            try:
+                await self.ws.send_text(json.dumps({"type": "turn_end"}))
+            except Exception:
+                pass
+                
+            # Save the gathered transcripts for the next turn
+            if user_text.strip():
+                self.memory.append({"role": "user", "text": user_text.strip()})
+            if assistant_text.strip():
+                self.memory.append({"role": "assistant", "text": assistant_text.strip()})
 
 
 @app.websocket("/ws/{session_id}")
@@ -238,31 +238,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
     bot = WSNovaSonic(ws, session_id)
     
     try:
-        await bot.start_session()
-        
-        # Start listening to Bedrock in the background
-        response_task = asyncio.create_task(bot.process_bedrock_responses())
-
-        # Listen to the Frontend
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
                 
-            # Audio chunks arriving from frontend mic
             if msg.get("bytes"):
                 if not bot.in_audio_turn:
-                    await bot.start_audio_input()
-                    bot.in_audio_turn = True
+                    await bot.start_audio_turn()
                 await bot.send_audio_chunk(msg["bytes"])
                 
-            # Control messages from frontend
             elif msg.get("text"):
                 try:
                     data = json.loads(msg["text"])
                     if data.get("type") == "end_of_turn" and bot.in_audio_turn:
-                        await bot.end_audio_input()
-                        bot.in_audio_turn = False
+                        await bot.end_audio_turn()
                 except Exception:
                     pass
 
@@ -271,5 +261,3 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
     except Exception as e:
         print(f"[{session_id}] WS ERROR: {e}")
         traceback.print_exc()
-    finally:
-        bot.is_active = False
