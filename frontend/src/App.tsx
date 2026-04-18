@@ -84,14 +84,17 @@ export default function App() {
     disconnectSession();
   }, [disconnectSession]);
 
+  // 🔥 CHANGED: Dynamic labels based on connection state and recording status
   const micLabel =
     status === 'recording'
-      ? 'Stop'
+      ? 'Listening…'
       : status === 'processing'
-      ? 'Wait…'
+      ? 'Thinking…'
       : status === 'speaking'
-      ? 'Playing'
-      : 'Speak';
+      ? 'AI Speaking…'
+      : isConnected
+      ? 'Listening...'
+      : 'Connect & Speak';
 
   return (
     <div className="app">
@@ -152,10 +155,12 @@ export default function App() {
 
       <footer className="app__footer">
         <WaveformBars active={status === 'recording'} />
+        
+        {/* 🔥 The Mic button dynamically changes its text now */}
         <button
           className={`mic-btn mic-btn--${status}`}
           onClick={handleMicPress}
-          disabled={status === 'processing'}
+          disabled={status === 'processing' || status === 'speaking'}
           aria-label={micLabel}
         >
           <span className="mic-btn__ring mic-btn__ring--1" />
@@ -163,6 +168,7 @@ export default function App() {
           <MicIcon status={status} />
           <span className="mic-btn__label">{micLabel}</span>
         </button>
+        
         <WaveformBars active={status === 'speaking'} />
       </footer>
     </div>
