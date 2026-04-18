@@ -1,3 +1,6 @@
+⚠️ This README needs an update
+
+
 # VoiceAI — Production Voice Chatbot
 
 A full-stack voice chatbot using **AssemblyAI** for transcription, **LangChain + Gemini** for conversational AI, and **browser TTS** for speech output. Pure HTTP — no WebSockets, no streaming.
