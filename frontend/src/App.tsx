@@ -54,6 +54,8 @@ export default function App() {
     startRecording,
     stopRecording,
     clearSession,
+    disconnectSession,
+    isConnected,
     status,
     error,
     messages
@@ -78,6 +80,10 @@ export default function App() {
     clearSession();
   }, [clearSession]);
 
+  const handleDisconnect = useCallback(() => {
+    disconnectSession();
+  }, [disconnectSession]);
+
   const micLabel =
     status === 'recording'
       ? 'Stop'
@@ -97,10 +103,23 @@ export default function App() {
           <h1>VoiceAI</h1>
         </div>
         <div className="app__header-right">
+          
+          <div className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+            <span className="connection-dot" />
+            {isConnected ? 'Online' : 'Offline'}
+          </div>
+
           <StatusBadge status={status} />
+          
+          {isConnected && (
+            <button className="btn btn--ghost" onClick={handleDisconnect}>
+              Disconnect
+            </button>
+          )}
+
           {messages.length > 0 && (
             <button className="btn btn--ghost" onClick={handleClear}>
-              Clear
+              Clear Chat
             </button>
           )}
         </div>

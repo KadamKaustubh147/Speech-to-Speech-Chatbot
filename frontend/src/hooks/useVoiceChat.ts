@@ -9,14 +9,15 @@ export function useVoiceChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<RecordingStatus>('idle');
   const [error, setError] = useState<string | null>(null);
+  
+  // 🔥 NEW: Track actual WebSocket connection state
+  const [isConnected, setIsConnected] = useState<boolean>(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
-
-  // 🔥 NEW: track if any audio was actually sent
   const audioSentRef = useRef<boolean>(false);
 
   // ── WebSocket connection ─────────────────────────────────────────────
@@ -37,15 +38,18 @@ export function useVoiceChat() {
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
+        setIsConnected(true); // Set connected flag
         resolve(ws);
       };
 
       ws.onerror = () => {
         setError('WebSocket connection error.');
+        setIsConnected(false);
         reject(new Error('WebSocket connection failed'));
       };
 
       ws.onclose = () => {
+        setIsConnected(false); // Clear connected flag
         setStatus((prev) => (prev === 'speaking' ? prev : 'idle'));
       };
 
@@ -61,8 +65,7 @@ export function useVoiceChat() {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                   ...updated[updated.length - 1],
-                  content:
-                    updated[updated.length - 1].content + data.text,
+                  content: updated[updated.length - 1].content + data.text,
                 };
                 return updated;
               } else if (data.text) {
@@ -78,20 +81,14 @@ export function useVoiceChat() {
               }
               return prev;
             });
-
           } else if (data.type === 'turn_end') {
-            if (
-              nextPlayTimeRef.current <=
-              (audioContextRef.current?.currentTime ?? 0)
-            ) {
+            if (nextPlayTimeRef.current <= (audioContextRef.current?.currentTime ?? 0)) {
               setStatus('idle');
             }
-
           } else if (data.type === 'error') {
             setError(data.message ?? 'Unknown error from server.');
             setStatus('idle');
           }
-
         } else if (event.data instanceof ArrayBuffer) {
           setStatus('speaking');
           await playAudioData(event.data);
@@ -129,7 +126,6 @@ export function useVoiceChat() {
           nextPlayTimeRef.current = 0;
         }
       };
-
     } catch (err) {
       console.error('Failed to play audio chunk', err);
     }
@@ -146,31 +142,22 @@ export function useVoiceChat() {
 
     try {
       const ws = await connect(sessionId);
-
-      const AudioContextClass =
-        window.AudioContext || (window as any).webkitAudioContext;
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
 
       if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContextClass({
-          sampleRate: 16000,
-        });
+        audioContextRef.current = new AudioContextClass({ sampleRate: 16000 });
       }
 
       const ctx = audioContextRef.current;
-
       if (ctx.state === 'suspended') await ctx.resume();
 
       nextPlayTimeRef.current = 0;
-      audioSentRef.current = false; // 🔥 reset per turn
+      audioSentRef.current = false;
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
       const source = ctx.createMediaStreamSource(stream);
-
       // @ts-ignore
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
@@ -181,18 +168,16 @@ export function useVoiceChat() {
           const pcmData = new Int16Array(inputData.length);
 
           for (let i = 0; i < inputData.length; i++) {
-            pcmData[i] =
-              Math.max(-1, Math.min(1, inputData[i])) * 32767;
+            pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
           }
 
           ws.send(pcmData.buffer);
-          audioSentRef.current = true; // 🔥 mark audio sent
+          audioSentRef.current = true;
         }
       };
 
       source.connect(processor);
       processor.connect(ctx.destination);
-
       setStatus('recording');
 
     } catch (err) {
@@ -216,43 +201,42 @@ export function useVoiceChat() {
       mediaStreamRef.current = null;
     }
 
-    // 🔥 Only send end_of_turn if audio was actually sent
-    if (
-      wsRef.current?.readyState === WebSocket.OPEN &&
-      audioSentRef.current
-    ) {
-      wsRef.current.send(
-        JSON.stringify({ type: 'end_of_turn' })
-      );
+    if (wsRef.current?.readyState === WebSocket.OPEN && audioSentRef.current) {
+      wsRef.current.send(JSON.stringify({ type: 'end_of_turn' }));
     }
 
     audioSentRef.current = false;
   }, []);
 
-  // ── Clear session ──────────────────────────────────────────────────
-  const clearSession = useCallback(() => {
+  // 🔥 NEW: Disconnect session (keeps messages, drops WS)
+  const disconnectSession = useCallback(() => {
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
-
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
-
     nextPlayTimeRef.current = 0;
     audioSentRef.current = false;
-
-    setMessages([]);
+    setIsConnected(false);
     setStatus('idle');
-    setError(null);
   }, []);
+
+  // ── Clear session (wipes everything) ───────────────────────────────
+  const clearSession = useCallback(() => {
+    disconnectSession();
+    setMessages([]);
+    setError(null);
+  }, [disconnectSession]);
 
   return {
     startRecording,
     stopRecording,
     clearSession,
+    disconnectSession, // Exported new function
+    isConnected,       // Exported connection state
     status,
     error,
     messages,
