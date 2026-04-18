@@ -2,8 +2,6 @@ import asyncio
 import json
 import os
 import traceback
-from typing import Dict
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_aws.chat_models.bedrock_nova_sonic import ChatBedrockNovaSonic
@@ -17,20 +15,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active sessions: session_id → NovaSonicSession
-sessions: Dict[str, object] = {}
 
 def make_model():
-    """
-    Initializes the Bedrock Nova Sonic model.
-    Boto3 will automatically authenticate using the AWS_ACCESS_KEY_ID 
-    and AWS_SECRET_ACCESS_KEY environment variables provided by Docker.
-    """
     return ChatBedrockNovaSonic(
         model_id=os.getenv("NOVA_MODEL_ID", "amazon.nova-sonic-v1:0"),
         region_name=os.getenv("AWS_REGION", "us-east-1"),
         voice_id=os.getenv("NOVA_VOICE_ID", "matthew"),
     )
+
 
 @app.get("/health")
 def health():
@@ -40,77 +32,133 @@ def health():
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str):
     await ws.accept()
+    print(f"[{session_id}] Connected")
 
     try:
-        # Initializing the model INSIDE the try block so validation 
-        # or auth errors are caught and printed to the terminal.
         model = make_model()
 
         async with model.create_session() as session:
-            sessions[session_id] = session
 
-            # Kick off send and receive concurrently
-            send_task    = asyncio.create_task(_send_loop(ws, session))
-            receive_task = asyncio.create_task(_receive_loop(ws, session))
+            ready_event = asyncio.Event()
 
-            done, pending = await asyncio.wait(
-                [send_task, receive_task],
-                return_when=asyncio.FIRST_COMPLETED,
+            state = {
+                "turn_active": False,
+                "audio_sent": False,
+                "initialized": False,  # 🔥 NEW
+            }
+
+            send_task = asyncio.create_task(
+                _send_loop(ws, session, session_id, ready_event, state)
             )
-            for task in pending:
-                task.cancel()
+            receive_task = asyncio.create_task(
+                _receive_loop(ws, session, session_id, ready_event, state)
+            )
 
-    except WebSocketDisconnect:
-        print(f"[{session_id}] Client disconnected normally.")
+            await asyncio.wait([send_task, receive_task], return_when=asyncio.FIRST_COMPLETED)
+
     except Exception as e:
-        print(f"[{session_id}] SESSION SETUP ERROR: {e}")
-        traceback.print_exc()
-    finally:
-        sessions.pop(session_id, None)
+        print(f"[{session_id}] ERROR: {e}")
 
-async def _send_loop(ws: WebSocket, session):
-    """Receive audio chunks from browser → forward to Nova Sonic."""
-    audio_sent = False
+
+# ─────────────────────────────────────────────────────────────
+# SEND LOOP
+# ─────────────────────────────────────────────────────────────
+async def _send_loop(ws, session, session_id, ready_event, state):
     try:
+        await asyncio.wait_for(ready_event.wait(), timeout=10.0)
+        print(f"[{session_id}] Ready for audio")
+
         while True:
             msg = await ws.receive()
+
             if msg["type"] == "websocket.disconnect":
                 break
 
-            if "bytes" in msg and msg["bytes"]:
-                # Raw PCM audio bytes from browser
-                await session.send_audio_chunk(msg["bytes"])
-                audio_sent = True
+            # ── AUDIO ─────────────────────────────────────
+            if msg.get("bytes"):
+                if not state["turn_active"]:
+                    state["turn_active"] = True
+                    print(f"[{session_id}] TURN START")
 
-            elif "text" in msg and msg["text"]:
-                data = json.loads(msg["text"])
+                await session.send_audio_chunk(msg["bytes"])
+                state["audio_sent"] = True
+
+            # ── CONTROL ───────────────────────────────────
+            elif msg.get("text"):
+                try:
+                    data = json.loads(msg["text"])
+                except:
+                    continue
+
                 if data.get("type") == "end_of_turn":
-                    # Only tell AWS the turn ended IF audio was actually captured
-                    if audio_sent:
+
+                    if state["turn_active"] and state["audio_sent"]:
+                        print(f"[{session_id}] TURN END → sending to Nova")
+
                         await session.end_audio_input()
-                        audio_sent = False # reset for the next turn
+
+                        state["turn_active"] = False
+                        state["audio_sent"] = False
+
                     else:
-                        print(f"Skipped ending turn: No audio was sent by the client.")
+                        print(
+                            f"[{session_id}] Ignored end_of_turn "
+                            f"(turn_active={state['turn_active']}, audio_sent={state['audio_sent']})"
+                        )
+
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
-        print(f"SEND LOOP ERROR: {e}")
-        import traceback
+        print(f"[{session_id}] SEND ERROR: {e}")
         traceback.print_exc()
 
-async def _receive_loop(ws: WebSocket, session):
-    """Receive events from Nova Sonic → forward audio/text to browser."""
+
+# ─────────────────────────────────────────────────────────────
+# RECEIVE LOOP
+# ─────────────────────────────────────────────────────────────
+async def _receive_loop(ws, session, session_id, ready_event, state):
     try:
+        first = True
+
         async for event in session.receive_events():
-            if event["type"] == "audio":
-                # Send raw PCM back to browser as binary
+
+            # 🔥 THIS IS THE REAL FIX
+            if first:
+                ready_event.set()
+                first = False
+
+                # 🚨 FORCE CONTENT BLOCK CREATION
+                if not state["initialized"]:
+                    print(f"[{session_id}] Initializing content block")
+
+                    # Send tiny silent audio to open block
+                    await session.send_audio_chunk(b"\x00\x00")
+                    state["initialized"] = True
+
+            event_type = event.get("type")
+
+            if event_type == "audio":
                 await ws.send_bytes(event["audio"])
-            elif event["type"] == "text":
+
+            elif event_type == "text":
                 await ws.send_text(json.dumps({
                     "type": "transcript",
                     "role": event.get("role", "assistant"),
                     "text": event.get("text", ""),
                 }))
-            elif event["type"] == "content_block_stop":
-                await ws.send_text(json.dumps({"type": "turn_end"}))
+
+            elif event_type == "content_block_stop":
+                print(f"[{session_id}] TURN COMPLETE")
+                state["turn_active"] = False
+
+                await ws.send_text(json.dumps({
+                    "type": "turn_end"
+                }))
+
+            elif event_type == "error":
+                msg = event.get("message", "Unknown error")
+                print(f"[{session_id}] Nova error: {msg}")
+
     except Exception as e:
-        print(f"RECEIVE LOOP ERROR: {e}")
+        print(f"[{session_id}] RECEIVE ERROR: {e}")
         traceback.print_exc()
