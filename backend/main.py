@@ -237,6 +237,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
     
     bot = WSNovaSonic(ws, session_id)
     
+    # 🔥 NEW: The Concurrency Lock to prevent duplicate AWS sessions
+    turn_lock = asyncio.Lock()
+    
     try:
         while True:
             msg = await ws.receive()
@@ -244,15 +247,22 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 break
                 
             if msg.get("bytes"):
-                if not bot.in_audio_turn:
-                    await bot.start_audio_turn()
+                # Traffic Light: Safely pause incoming chunks until the AWS connection is open
+                async with turn_lock:
+                    if not bot.in_audio_turn:
+                        await bot.start_audio_turn()
+                
+                # Once the lock releases and the turn is active, send the chunk
                 await bot.send_audio_chunk(msg["bytes"])
                 
             elif msg.get("text"):
                 try:
                     data = json.loads(msg["text"])
-                    if data.get("type") == "end_of_turn" and bot.in_audio_turn:
-                        await bot.end_audio_turn()
+                    if data.get("type") == "end_of_turn":
+                        # Lock the end-turn process to prevent crossed wires
+                        async with turn_lock:
+                            if bot.in_audio_turn:
+                                await bot.end_audio_turn()
                 except Exception:
                     pass
 
