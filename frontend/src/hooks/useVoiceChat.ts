@@ -10,7 +10,6 @@ export function useVoiceChat() {
   const [status, setStatus] = useState<RecordingStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   
-  // 🔥 NEW: Track actual WebSocket connection state
   const [isConnected, setIsConnected] = useState<boolean>(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -19,8 +18,10 @@ export function useVoiceChat() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
   const audioSentRef = useRef<boolean>(false);
+  
+  // 🔥 Tracks when a new turn starts to prevent bubble gluing
+  const isNewTurnRef = useRef<boolean>(true);
 
-  // ── WebSocket connection ─────────────────────────────────────────────
   const connect = useCallback((sessionId: string): Promise<WebSocket> => {
     return new Promise((resolve, reject) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -38,7 +39,7 @@ export function useVoiceChat() {
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
-        setIsConnected(true); // Set connected flag
+        setIsConnected(true);
         resolve(ws);
       };
 
@@ -49,7 +50,7 @@ export function useVoiceChat() {
       };
 
       ws.onclose = () => {
-        setIsConnected(false); // Clear connected flag
+        setIsConnected(false);
         setStatus((prev) => (prev === 'speaking' ? prev : 'idle'));
       };
 
@@ -61,7 +62,8 @@ export function useVoiceChat() {
             setMessages((prev) => {
               const last = prev[prev.length - 1];
 
-              if (last && last.role === data.role) {
+              // ONLY append if roles match AND it is NOT a new turn
+              if (last && last.role === data.role && !isNewTurnRef.current) {
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                   ...updated[updated.length - 1],
@@ -69,6 +71,8 @@ export function useVoiceChat() {
                 };
                 return updated;
               } else if (data.text) {
+                // Turn off the new turn flag after the first chunk creates the bubble
+                isNewTurnRef.current = false;
                 return [
                   ...prev,
                   {
@@ -97,29 +101,22 @@ export function useVoiceChat() {
     });
   }, []);
 
-  // ── Audio playback ──────────────────────────────────────────────────
   const playAudioData = async (arrayBuffer: ArrayBuffer) => {
     const ctx = audioContextRef.current;
     if (!ctx) return;
-
     try {
       const int16Array = new Int16Array(arrayBuffer);
       const audioBuffer = ctx.createBuffer(1, int16Array.length, 16000);
       const channelData = audioBuffer.getChannelData(0);
-
       for (let i = 0; i < int16Array.length; i++) {
         channelData[i] = int16Array[i] / 32768.0;
       }
-
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(ctx.destination);
-
       const playTime = Math.max(ctx.currentTime, nextPlayTimeRef.current);
       source.start(playTime);
-
       nextPlayTimeRef.current = playTime + audioBuffer.duration;
-
       source.onended = () => {
         if (nextPlayTimeRef.current <= ctx.currentTime + 0.05) {
           setStatus('idle');
@@ -131,9 +128,9 @@ export function useVoiceChat() {
     }
   };
 
-  // ── Start recording ─────────────────────────────────────────────────
   const startRecording = useCallback(async (sessionId: string) => {
     setError(null);
+    isNewTurnRef.current = true; // Set new turn to TRUE when mic is pressed
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Microphone blocked. Use HTTPS or localhost.');
@@ -143,11 +140,9 @@ export function useVoiceChat() {
     try {
       const ws = await connect(sessionId);
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-
       if (!audioContextRef.current) {
         audioContextRef.current = new AudioContextClass({ sampleRate: 16000 });
       }
-
       const ctx = audioContextRef.current;
       if (ctx.state === 'suspended') await ctx.resume();
 
@@ -166,11 +161,9 @@ export function useVoiceChat() {
         if (ws.readyState === WebSocket.OPEN) {
           const inputData = e.inputBuffer.getChannelData(0);
           const pcmData = new Int16Array(inputData.length);
-
           for (let i = 0; i < inputData.length; i++) {
             pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
           }
-
           ws.send(pcmData.buffer);
           audioSentRef.current = true;
         }
@@ -187,28 +180,22 @@ export function useVoiceChat() {
     }
   }, [connect]);
 
-  // ── Stop recording ─────────────────────────────────────────────────
   const stopRecording = useCallback(() => {
     setStatus('processing');
-
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
     }
-
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-
     if (wsRef.current?.readyState === WebSocket.OPEN && audioSentRef.current) {
       wsRef.current.send(JSON.stringify({ type: 'end_of_turn' }));
     }
-
     audioSentRef.current = false;
   }, []);
 
-  // 🔥 NEW: Disconnect session (keeps messages, drops WS)
   const disconnectSession = useCallback(() => {
     if (wsRef.current) {
       wsRef.current.close();
@@ -224,7 +211,6 @@ export function useVoiceChat() {
     setStatus('idle');
   }, []);
 
-  // ── Clear session (wipes everything) ───────────────────────────────
   const clearSession = useCallback(() => {
     disconnectSession();
     setMessages([]);
@@ -232,13 +218,6 @@ export function useVoiceChat() {
   }, [disconnectSession]);
 
   return {
-    startRecording,
-    stopRecording,
-    clearSession,
-    disconnectSession, // Exported new function
-    isConnected,       // Exported connection state
-    status,
-    error,
-    messages,
+    startRecording, stopRecording, clearSession, disconnectSession, isConnected, status, error, messages,
   };
 }

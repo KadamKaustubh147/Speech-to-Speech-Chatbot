@@ -61,90 +61,98 @@ class WSNovaSonic:
 
     async def start_audio_turn(self):
         """Creates a fresh stream per turn and injects the ENTIRE memory array as context."""
-        self.stream = await self.client.invoke_model_with_bidirectional_stream(
-            InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
-        )
-        self.prompt_name = str(uuid.uuid4())
         
-        await self._send_event('{"event": {"sessionStart": {"inferenceConfiguration": {"maxTokens": 1024, "topP": 0.9, "temperature": 0.7}}}}')
+        # 🔥 FIX: Lock the turn instantly before doing any async network calls
+        self.in_audio_turn = True
         
-        await self._send_event(f'''
-        {{
-          "event": {{
-            "promptStart": {{
-              "promptName": "{self.prompt_name}",
-              "textOutputConfiguration": {{ "mediaType": "text/plain" }},
-              "audioOutputConfiguration": {{
-                "mediaType": "audio/lpcm",
-                "sampleRateHertz": 16000,
-                "sampleSizeBits": 16,
-                "channelCount": 1,
-                "voiceId": "matthew",
-                "encoding": "base64",
-                "audioType": "SPEECH"
+        try:
+            self.stream = await self.client.invoke_model_with_bidirectional_stream(
+                InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
+            )
+            self.prompt_name = str(uuid.uuid4())
+            
+            await self._send_event('{"event": {"sessionStart": {"inferenceConfiguration": {"maxTokens": 1024, "topP": 0.9, "temperature": 0.7}}}}')
+            
+            await self._send_event(f'''
+            {{
+              "event": {{
+                "promptStart": {{
+                  "promptName": "{self.prompt_name}",
+                  "textOutputConfiguration": {{ "mediaType": "text/plain" }},
+                  "audioOutputConfiguration": {{
+                    "mediaType": "audio/lpcm",
+                    "sampleRateHertz": 16000,
+                    "sampleSizeBits": 16,
+                    "channelCount": 1,
+                    "voiceId": "matthew",
+                    "encoding": "base64",
+                    "audioType": "SPEECH"
+                  }}
+                }}
               }}
             }}
-          }}
-        }}
-        ''')
-        
-        sys_c_name = str(uuid.uuid4())
-        await self._send_event(f'''
-        {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "type": "TEXT", "interactive": false, "role": "SYSTEM", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
-        ''')
-        
-        system_prompt = json.dumps("You are a friendly voice assistant. Keep responses brief and conversational.")
-        await self._send_event(f'''
-        {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "content": {system_prompt} }} }} }}
-        ''')
-        
-        await self._send_event(f'''
-        {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}" }} }} }}
-        ''')
-
-        # Inject conversation history cleanly
-        for msg in self.memory:
-            hist_c_name = str(uuid.uuid4())
-            role = msg["role"].upper()
-            safe_text = json.dumps(msg["text"])
+            ''')
             
+            sys_c_name = str(uuid.uuid4())
             await self._send_event(f'''
-            {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "type": "TEXT", "interactive": false, "role": "{role}", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
+            {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "type": "TEXT", "interactive": false, "role": "SYSTEM", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
+            ''')
+            
+            system_prompt = json.dumps("You are a friendly voice assistant. Keep responses brief and conversational.")
+            await self._send_event(f'''
+            {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}", "content": {system_prompt} }} }} }}
             ''')
             
             await self._send_event(f'''
-            {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "content": {safe_text} }} }} }}
-            ''')
-            
-            await self._send_event(f'''
-            {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}" }} }} }}
+            {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{sys_c_name}" }} }} }}
             ''')
 
-        self.audio_c_name = str(uuid.uuid4())
-        await self._send_event(f'''
-        {{
-            "event": {{
-                "contentStart": {{
-                    "promptName": "{self.prompt_name}",
-                    "contentName": "{self.audio_c_name}",
-                    "type": "AUDIO",
-                    "interactive": true,
-                    "role": "USER",
-                    "audioInputConfiguration": {{
-                        "mediaType": "audio/lpcm",
-                        "sampleRateHertz": 16000,
-                        "sampleSizeBits": 16,
-                        "channelCount": 1,
-                        "audioType": "SPEECH",
-                        "encoding": "base64"
+            # Inject conversation history cleanly
+            for msg in self.memory:
+                hist_c_name = str(uuid.uuid4())
+                role = msg["role"].upper()
+                safe_text = json.dumps(msg["text"])
+                
+                await self._send_event(f'''
+                {{ "event": {{ "contentStart": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "type": "TEXT", "interactive": false, "role": "{role}", "textInputConfiguration": {{ "mediaType": "text/plain" }} }} }} }}
+                ''')
+                
+                await self._send_event(f'''
+                {{ "event": {{ "textInput": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}", "content": {safe_text} }} }} }}
+                ''')
+                
+                await self._send_event(f'''
+                {{ "event": {{ "contentEnd": {{ "promptName": "{self.prompt_name}", "contentName": "{hist_c_name}" }} }} }}
+                ''')
+
+            self.audio_c_name = str(uuid.uuid4())
+            await self._send_event(f'''
+            {{
+                "event": {{
+                    "contentStart": {{
+                        "promptName": "{self.prompt_name}",
+                        "contentName": "{self.audio_c_name}",
+                        "type": "AUDIO",
+                        "interactive": true,
+                        "role": "USER",
+                        "audioInputConfiguration": {{
+                            "mediaType": "audio/lpcm",
+                            "sampleRateHertz": 16000,
+                            "sampleSizeBits": 16,
+                            "channelCount": 1,
+                            "audioType": "SPEECH",
+                            "encoding": "base64"
+                        }}
                     }}
                 }}
             }}
-        }}
-        ''')
+            ''')
 
-        self.in_audio_turn = True
-        asyncio.create_task(self.process_responses(self.stream))
+            asyncio.create_task(self.process_responses(self.stream))
+            
+        except Exception as e:
+            self.in_audio_turn = False
+            print(f"Error starting turn: {e}")
 
     async def send_audio_chunk(self, audio_bytes):
         if self.in_audio_turn and self.stream:
@@ -214,10 +222,8 @@ class WSNovaSonic:
                             await self.ws.send_bytes(audio_bytes)
                             
         except Exception as e:
-            # Stream gracefully closes when AWS finishes its response
             pass
         finally:
-            # Tell the frontend the turn is fully complete so the mic button resets
             try:
                 await self.ws.send_text(json.dumps({"type": "turn_end"}))
             except Exception:
@@ -236,9 +242,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
     print(f"[{session_id}] Connected")
     
     bot = WSNovaSonic(ws, session_id)
-    
-    # 🔥 NEW: The Concurrency Lock to prevent duplicate AWS sessions
-    turn_lock = asyncio.Lock()
+    turn_lock = asyncio.Lock()  # 🔥 FIX: Concurrency lock
     
     try:
         while True:
@@ -247,19 +251,16 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 break
                 
             if msg.get("bytes"):
-                # Traffic Light: Safely pause incoming chunks until the AWS connection is open
+                # Traffic Light: Safely pause incoming chunks until the connection is officially open
                 async with turn_lock:
                     if not bot.in_audio_turn:
                         await bot.start_audio_turn()
-                
-                # Once the lock releases and the turn is active, send the chunk
                 await bot.send_audio_chunk(msg["bytes"])
                 
             elif msg.get("text"):
                 try:
                     data = json.loads(msg["text"])
                     if data.get("type") == "end_of_turn":
-                        # Lock the end-turn process to prevent crossed wires
                         async with turn_lock:
                             if bot.in_audio_turn:
                                 await bot.end_audio_turn()
