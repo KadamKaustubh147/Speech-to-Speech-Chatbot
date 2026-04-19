@@ -188,11 +188,11 @@ class WSNovaSonic:
             self.in_audio_turn = False
 
     async def process_responses(self, active_stream):
-        """Listen to AWS output until it naturally closes, ensuring all text and audio is received."""
         user_text = ""
         assistant_text = ""
         current_role = "assistant"
-        
+        display_assistant_text = False  # 🔥 ADD THIS
+
         try:
             while True:
                 output = await active_stream.await_output()
@@ -211,19 +211,32 @@ class WSNovaSonic:
                         if 'contentStart' in event:
                             current_role = event['contentStart'].get('role', 'ASSISTANT').lower()
                             
+                            # 🔥 THE REAL FIX: Only show SPECULATIVE stage text
+                            display_assistant_text = False
+                            if 'additionalModelFields' in event['contentStart']:
+                                additional_fields = json.loads(event['contentStart']['additionalModelFields'])
+                                if additional_fields.get('generationStage') == 'SPECULATIVE':
+                                    display_assistant_text = True
+
                         elif 'textOutput' in event:
                             text = event['textOutput']['content']
+                            
                             if current_role == "user":
                                 user_text += text
-                            else:
+                                await self.ws.send_text(json.dumps({
+                                    "type": "transcript",
+                                    "role": "user",
+                                    "text": text
+                                }))
+                            elif current_role == "assistant" and display_assistant_text:
+                                # 🔥 Only send if SPECULATIVE — drops the duplicate final transcript
                                 assistant_text += text
+                                await self.ws.send_text(json.dumps({
+                                    "type": "transcript",
+                                    "role": "assistant",
+                                    "text": text
+                                }))
                                 
-                            await self.ws.send_text(json.dumps({
-                                "type": "transcript",
-                                "role": current_role,
-                                "text": text
-                            }))
-                            
                         elif 'audioOutput' in event:
                             audio_bytes = base64.b64decode(event['audioOutput']['content'])
                             await self.ws.send_bytes(audio_bytes)
@@ -236,12 +249,10 @@ class WSNovaSonic:
             except Exception:
                 pass
                 
-            # Save the gathered transcripts for the next turn
             if user_text.strip():
                 self.memory.append({"role": "user", "text": user_text.strip()})
             if assistant_text.strip():
                 self.memory.append({"role": "assistant", "text": assistant_text.strip()})
-
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str):
