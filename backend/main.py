@@ -51,6 +51,9 @@ class WSNovaSonic:
         self.prompt_name = None
         self.audio_c_name = None
         self.in_audio_turn = False
+        
+        # 🔥 THE FIX: A physical lock to prevent multiple background streams
+        self.current_task = None
 
     async def _send_event(self, event_json):
         if self.stream:
@@ -62,7 +65,10 @@ class WSNovaSonic:
     async def start_audio_turn(self):
         """Creates a fresh stream per turn and injects the ENTIRE memory array as context."""
         
-        # 🔥 FIX: Lock the turn instantly before doing any async network calls
+        # 🔥 THE FIX: Prevent spawning a new turn if the AI is currently processing one
+        if self.current_task and not self.current_task.done():
+            return
+            
         self.in_audio_turn = True
         
         try:
@@ -148,7 +154,8 @@ class WSNovaSonic:
             }}
             ''')
 
-            asyncio.create_task(self.process_responses(self.stream))
+            # 🔥 TRACK THE TASK: Save the task reference so we can block duplicates
+            self.current_task = asyncio.create_task(self.process_responses(self.stream))
             
         except Exception as e:
             self.in_audio_turn = False
@@ -242,7 +249,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
     print(f"[{session_id}] Connected")
     
     bot = WSNovaSonic(ws, session_id)
-    turn_lock = asyncio.Lock()  # 🔥 FIX: Concurrency lock
+    turn_lock = asyncio.Lock()  
     
     try:
         while True:

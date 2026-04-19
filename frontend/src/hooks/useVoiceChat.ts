@@ -19,7 +19,7 @@ export function useVoiceChat() {
   const nextPlayTimeRef = useRef<number>(0);
   const audioSentRef = useRef<boolean>(false);
   
-  // 🔥 Tracks when a new turn starts to prevent bubble gluing
+  // 🔥 Crucial: Tracks when a new turn starts to prevent gluing different turns together
   const isNewTurnRef = useRef<boolean>(true);
 
   const connect = useCallback((sessionId: string): Promise<WebSocket> => {
@@ -58,21 +58,35 @@ export function useVoiceChat() {
         if (typeof event.data === 'string') {
           const data = JSON.parse(event.data);
 
-          if (data.type === 'transcript') {
+          if (data.type === 'transcript' && data.text) {
+            
+            // Read the ref value OUTSIDE the state setter to avoid React Strict Mode bugs
+            const isNewTurn = isNewTurnRef.current;
+            
+            if (isNewTurn) {
+              isNewTurnRef.current = false;
+            }
+
             setMessages((prev) => {
               const last = prev[prev.length - 1];
 
               // ONLY append if roles match AND it is NOT a new turn
-              if (last && last.role === data.role && !isNewTurnRef.current) {
+              if (last && last.role === data.role && !isNewTurn) {
+                
+                // 🔥 THE AWS DEDUPLICATOR
+                // If AWS glitches and sends the exact same text chunk twice in a row, drop it.
+                if (last.content.endsWith(data.text)) {
+                  return prev;
+                }
+
                 const updated = [...prev];
                 updated[updated.length - 1] = {
                   ...updated[updated.length - 1],
                   content: updated[updated.length - 1].content + data.text,
                 };
                 return updated;
-              } else if (data.text) {
-                // Turn off the new turn flag after the first chunk creates the bubble
-                isNewTurnRef.current = false;
+              } else {
+                // Safely generate a brand new chat bubble
                 return [
                   ...prev,
                   {
@@ -83,7 +97,6 @@ export function useVoiceChat() {
                   },
                 ];
               }
-              return prev;
             });
           } else if (data.type === 'turn_end') {
             if (nextPlayTimeRef.current <= (audioContextRef.current?.currentTime ?? 0)) {
@@ -130,7 +143,7 @@ export function useVoiceChat() {
 
   const startRecording = useCallback(async (sessionId: string) => {
     setError(null);
-    isNewTurnRef.current = true; // Set new turn to TRUE when mic is pressed
+    isNewTurnRef.current = true; // ✅ Trigger the new turn flag on mic press
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Microphone blocked. Use HTTPS or localhost.');
